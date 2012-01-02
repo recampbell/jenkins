@@ -23,24 +23,31 @@
  */
 package hudson.tasks;
 
+import hudson.Extension;
 import hudson.FilePath;
 import hudson.Launcher;
 import hudson.Util;
-import hudson.Extension;
 import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
 import hudson.model.BuildListener;
 import hudson.model.Result;
 import hudson.util.FormValidation;
-import org.kohsuke.stapler.StaplerRequest;
-import org.kohsuke.stapler.DataBoundConstructor;
-import org.kohsuke.stapler.AncestorInPath;
-import org.kohsuke.stapler.QueryParameter;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import net.sf.json.JSONObject;
+
+import org.kohsuke.stapler.AncestorInPath;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
 
 /**
  * Copies the artifacts into an archive directory.
@@ -181,6 +188,19 @@ public class ArtifactArchiver extends Recorder {
 
     @Extension
     public static class DescriptorImpl extends BuildStepDescriptor<Publisher> {
+    	
+    	/**
+    	 * Limit the total number simultaneous artifact checks
+    	 */
+    	private static int MAX_SIMULTANEOUS_CHECKS = Integer.getInteger(ArtifactArchiver.DescriptorImpl.class.getName() + ".MAX_SIMULTANEOUS_CHECKS",5);
+        private static ExecutorService es = Executors.newFixedThreadPool(MAX_SIMULTANEOUS_CHECKS);
+        
+        /**
+         * Prevent artifact checks from spinning forever in large workspaces. 
+         * See https://issues.jenkins-ci.org/browse/JENKINS-12271
+         */
+    	private static int CHECK_TIMEOUT_SECONDS = Integer.getInteger(ArtifactArchiver.DescriptorImpl.class.getName() + ".CHECK_TIMEOUT",15);
+    	
         public DescriptorImpl() {
             DESCRIPTOR = this; // backward compatibility
         }
@@ -192,8 +212,23 @@ public class ArtifactArchiver extends Recorder {
         /**
          * Performs on-the-fly validation on the file mask wildcard.
          */
-        public FormValidation doCheckArtifacts(@AncestorInPath AbstractProject project, @QueryParameter String value) throws IOException {
-            return FilePath.validateFileMask(project.getSomeWorkspace(),value);
+        public FormValidation doCheckArtifacts(final @AncestorInPath AbstractProject project, final @QueryParameter String value) throws IOException {
+            // Timeout 
+        	try {
+				return es.submit(new Callable<FormValidation>() {
+					public FormValidation call() throws Exception {
+				    	return FilePath.validateFileMask(project.getSomeWorkspace(),value);
+					}
+				}).get(CHECK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				throw new IOException("Archive check aborted");
+			} catch (ExecutionException e) {
+				throw new IOException(e);
+			} catch (TimeoutException e) {
+				throw new IOException("Archive check timed out");
+			}
+        	
         }
 
         @Override
